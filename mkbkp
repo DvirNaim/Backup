@@ -1,0 +1,484 @@
+/*
+ * Dvir Naim
+ * Linux backup
+ * This program will backup a directory (DIR), regular file or asymlink and restore
+ * with the same info - mod time, permissions, uid, gid and links.
+ * To backup write "./mkbkp -c [backupfile] [file_to_backup]"
+ * To restore write "./mkbkp -x [backupfile]"
+ */
+
+#include	<sys/types.h>
+#include	<sys/stat.h>
+#include        <fcntl.h>
+#include        <stdlib.h>
+#include        <stdio.h>
+#include        <unistd.h>
+#include  <dirent.h>
+#include <string.h>
+#include <time.h>
+#include <errno.h>
+#include <utime.h>
+
+int restorehandle(FILE *src, char *path);
+FILE *restoredir(FILE *src,char *path);
+FILE *restorereg(FILE *src,char *path);
+FILE *restoresym(FILE *src,char *path);
+FILE *bkpregular(FILE *des,FILE *src,char *path, struct stat *sb);
+FILE *bkpdir(FILE *des,char *path, struct stat *sbsrc);
+FILE *bkpsymlink(FILE *des,char *path ,struct stat *sb);
+
+typedef struct dir
+{
+    char* path;
+    unsigned long int modtim;
+
+}fileutime;
+/*
+ * Because I'm changing the DIR's all the time I saved the utime of the DIR's to the end.
+ * otherwise, if I'll change after the creation of the DIR, the time will change again
+ * after we create the 1st file in the DIR.
+ */
+void utimedir(char* npath, unsigned long int ntime,int charsize,int flag)
+{
+    static fileutime *filearr;
+    static int x=0;
+    struct utimbuf tmptim;
+    int i;
+    //Save all the DIR's info
+    if(flag==0)
+    {
+        if(x==0)
+        {
+            filearr=malloc(sizeof(fileutime));
+            if(!filearr)
+                {
+                    perror("malloc failed\n");
+                    exit(1);
+                }
+            x++;
+        }
+        else
+        {
+            x++;
+            filearr=realloc(filearr,x*sizeof(fileutime));
+            if(!filearr)
+                {
+                    perror("malloc failed\n");
+                    exit(1);
+                }
+        }
+        filearr[x-1].path=malloc(charsize+1);
+        strcat(filearr[x-1].path,npath);
+        filearr[x-1].modtim=ntime;
+    }
+    //The final - now we change everything
+    else
+    {
+        for(i=0;i<x;i++)
+        {
+            tmptim.modtime=filearr[i].modtim;
+            utime(filearr[i].path,&tmptim);
+            free(filearr[i].path);
+        }
+        free(filearr);
+        exit(1);
+    }
+}
+//This function is to merge two path names.
+char* concat(char *s1, char *s2)
+{
+    char *result = malloc(strlen(s1)+strlen(s2)+2);//+2 for "/" and for the zero-terminator
+    if(result==NULL)
+    {
+    	fprintf(stderr, "malloc error!\n");
+    	exit(1);
+    }
+    strcpy(result, s1);
+    strcat(result,"/");
+    strcat(result, s2);
+    return result;
+}
+
+int main(int argc, char* argv[])
+{
+
+	FILE *backupfile,*src;
+	struct stat sb;
+
+	if((argc<3)||(argc>4))
+		{
+			perror("please write 3 args for restore and 4 args for backup\n");
+			exit(EXIT_FAILURE);
+		}
+	//Backup
+	if(strcmp(argv[1],"-c")==0)
+	{
+	if(argc!=4)
+	{
+		perror("please write 4 args for backup\n");
+		exit(EXIT_FAILURE);
+	}
+	if(!(backupfile=fopen(argv[2],"w")))
+	{
+		perror("error while open file");
+		exit(EXIT_FAILURE);
+	}
+
+	if (lstat(argv[3], &sb) == -1)
+	{
+			perror("lstat");
+	        exit(EXIT_FAILURE);
+	        exit(1);
+	}
+	if      (S_ISREG(sb.st_mode))
+	{
+		if(!(src=fopen(argv[3],"r")))
+		{
+				perror("error while open file\n");
+				exit(EXIT_FAILURE);
+		}
+		backupfile=bkpregular(backupfile,src,argv[3],&sb);//ptr = "regular";
+	}
+	else if (S_ISDIR(sb.st_mode))
+	{
+		backupfile=bkpdir(backupfile,argv[3], &sb);//ptr = "directory";
+	}
+	#ifdef	S_ISLNK
+	else if (S_ISLNK(sb.st_mode))
+	{
+		backupfile=bkpsymlink(backupfile,argv[3],&sb);//ptr = "symbolic link";
+	}
+	#endif
+	else
+	{
+		perror("Not supported type\n");
+		exit(EXIT_FAILURE);
+	}
+	}
+	//Restore
+	else if(strcmp(argv[1],"-x")==0)
+	{
+		if(argc!=3)
+			{
+				perror("please write 3 args for restore\n");
+				exit(EXIT_FAILURE);
+			}
+		if(!(backupfile=fopen(argv[2],"r")))
+				{
+			perror("No such backup file");
+			exit(EXIT_FAILURE);
+				}
+		umask(0);
+		restorehandle(backupfile,argv[2]);
+
+	}
+	else
+	{
+		printf("please write according to the mold\n ./mkbkp -x\\-c backupfile [backupsrc]\n");
+		exit(1);
+	}
+
+
+	return 1;
+
+
+
+
+}
+/*
+ * Restore section
+ */
+
+//Restore handler
+int restorehandle(FILE *src, char *path)
+{
+	char type;
+	fflush( stdout );
+	rewind(src);
+	//Taking care of every file separately
+	while((type=(char)fgetc(src)))
+	{
+		if(feof(src))
+		{
+			printf("Done!\n");
+			utimedir("1",1,1,1);
+			break;
+		}
+
+	if(type=='r')
+		{
+		//regularfile
+		src=restorereg(src,path);
+		}
+	else if(type=='d')
+		{
+		//directory file
+		src=restoredir(src,path);
+		}
+	else if(type=='s')
+		{
+		//symlink
+		src=restoresym(src,path);
+		}
+	else
+		continue;
+	}
+	return 1;
+
+}
+
+//Restore diractory
+FILE *restoredir(FILE *src,char *path)
+{
+	unsigned long mode;
+	time_t timeres;
+	int uid,gid,namesize;
+	char *name;
+	fscanf(src,"%d",&namesize);
+	name=malloc(namesize+1);
+	if(!name)
+	{
+		perror("Problem allocating");
+		exit(EXIT_FAILURE);
+	}
+	fgetc(src);
+	fgets(name,namesize+1,src);
+	//Getting file info
+	if(fscanf(src,"%lu %d %d %lu", &mode, &uid, &gid,&timeres)<1)
+	{
+		printf("something went wrong with fscanf()! %s\n", strerror(errno));
+		exit(1);
+	}
+	//Creating dir
+	if(mkdir(name,mode)==-1)
+	{
+		printf("something went wrong with mkdir()! %s\n", strerror(errno));
+		exit(1);
+	}
+	umask(0);
+	chown(name,uid,gid);
+	//Time changing
+	utimedir(name,timeres,namesize,0);
+	free(name);
+	return src;
+}
+//Restore regular file
+FILE *restorereg(FILE *src,char *path)
+{
+	struct utimbuf new_times;
+	FILE *des;
+	time_t timeres;
+	unsigned long mode;
+	int uid,gid,size,get,i,namesize;
+	char *filename;
+	fscanf(src,"%d",&namesize);
+	filename=malloc(namesize+1);
+	if(!filename)
+		{
+			perror("Problem allocating");
+			exit(EXIT_FAILURE);
+		}
+	fgetc(src);
+	fgets(filename,namesize+1,src);
+	if(fscanf(src,"%lu %d %d %d %lu", &mode, &uid, &gid, &size, &timeres)<1)
+		{
+			printf("something went wrong with fscanf()! %s\n", strerror(errno));
+			exit(1);
+		}
+	if( access( filename, F_OK ) != -1 )
+	{
+		//file exist
+	    printf("the file %s, is already exists. try other file.\n",filename);
+	    exit(1);
+	}
+	else
+	{
+	    // file doesn't exist
+
+    if (creat(filename, mode) < 0)
+    {
+    	printf("something went wrong with create! %s\n", strerror(errno));
+    	exit(1);
+    }
+    if(!(des=fopen(filename,"w")))
+    		{
+    				perror("error while open file restoreg\n");
+    				exit(EXIT_FAILURE);
+    		}
+    umask(0);
+	chown(filename,uid,gid);
+	if(size>0)
+		fgetc(src);
+	//Restore file content
+    for(i=0;i<size;i++)
+    {
+    	get=fgetc(src);
+    	fputc(get,des);
+    }
+    //Time changing
+    new_times.actime=time(NULL);
+    new_times.modtime=timeres;
+    fclose(des);
+    utime(filename, &new_times);
+    free(filename);
+	return src;
+	}
+}
+//Restore symlink
+FILE *restoresym(FILE *src,char *path)
+{
+	unsigned long mode;
+	unsigned int uid,gid,symsize, dessize;
+	char *sympath,*despath;
+	fscanf(src,"%d %d",&symsize, &dessize);
+	sympath=malloc(symsize+1);
+	despath=malloc(dessize+1);
+	if((!sympath)||(!despath))
+		{
+			perror("Problem allocating");
+			exit(EXIT_FAILURE);
+		}
+	fgetc(src);
+	fgets(sympath,symsize+1,src);
+	fgetc(src);
+	fgets(despath,dessize+1,src);
+	//Get sym info
+	if (fscanf(src,"%lu %d %d ",&mode,&uid,&gid)<0)
+		{
+		      fprintf(stderr, "symlink - 'fscanf' error\n");
+		      exit(EXIT_FAILURE);
+		}
+	//Create symlink
+	if(symlink(despath,sympath)<0)
+			{
+			 	 perror("Problem creating symlink\n");
+			 	 exit(EXIT_FAILURE);
+			}
+	chmod(sympath,mode);
+	chown(sympath,uid,gid);
+	return src;
+}
+/*
+ * Backup section
+ */
+//Backup regular file
+FILE *bkpregular(FILE *des,FILE *src, char *path, struct stat *sb)
+{
+	unsigned int uid,gid;
+	int trans,size,namesize;
+	unsigned long mode;
+	time_t timebkp;
+	mode=(unsigned long) sb->st_mode;
+	uid=(unsigned int)sb->st_uid;
+	gid=(unsigned int)sb->st_gid;
+	timebkp=sb->st_mtime;
+	size=sb->st_size;
+	namesize=strlen(path);
+	if (fprintf(des,"r\n%d\n%s\n%lu\n%d\n%d\n%d\n%lu\n",namesize,path,mode,uid,gid,size,timebkp)<0)
+	{
+	      fprintf(stderr, "regfile - 'Write on file' error\n");
+	      exit(EXIT_FAILURE);
+	}
+	do
+	{
+		trans=fgetc(src);
+		if(feof(src))
+			break;
+		fputc(trans,des);
+	}while(1);
+	return des;
+}
+//Backup dir
+FILE *bkpdir(FILE *des,char *path,struct stat *sbsrc)
+{
+	DIR *dir;
+	FILE *src;
+	int namesize;
+	struct stat sb;
+	struct dirent *curdir;
+	char *newdir;
+	unsigned int uid,gid;
+	unsigned long mode;
+	time_t timebkp;
+	mode=(unsigned long) sbsrc->st_mode;
+	uid=(unsigned int)sbsrc->st_uid;
+	gid=(unsigned int)sbsrc->st_gid;
+	timebkp=sbsrc->st_mtime;
+	namesize=strlen(path);
+	if (fprintf(des,"d\n%d\n%s\n%lu\n%d\n%d\n%lu\n",namesize,path,mode,uid,gid,timebkp)<0)
+	{
+	      fprintf(stderr, "bkdir - 'Write on file' error\n");
+	      exit(EXIT_FAILURE);
+	}
+
+	//Open dir to back up the inside files
+	dir=opendir(path);
+		while((curdir=readdir(dir))!=NULL)
+		{
+			if(!strcmp(curdir->d_name,".")||!strcmp(curdir->d_name,".."))
+			{
+				continue;
+			}
+			newdir=concat(path,curdir->d_name);
+
+			if (lstat(newdir, &sb) == -1)
+				{
+					perror("lstat");
+				    exit(EXIT_FAILURE);
+				}
+			if(S_ISREG(sb.st_mode))
+			{
+				src=fopen(newdir,"r+");
+				des=bkpregular(des,src,newdir,&sb);//ptr = "regular";
+			}
+			else if (S_ISDIR(sb.st_mode))
+			{
+				des=bkpdir(des,newdir,&sb);//ptr = "directory";
+			}
+			#ifdef	S_ISLNK
+			else if (S_ISLNK(sb.st_mode))
+			{
+				bkpsymlink(des,newdir, &sb);//ptr = "symbolic link";
+			}
+			#endif
+			else
+			{
+				printf("%s not supported file",newdir);
+			}
+
+
+			free(newdir);
+		}
+		closedir(dir);
+		return des;
+}
+//Backup symlink
+FILE *bkpsymlink(FILE *des,char *path ,struct stat *sb)
+{
+	unsigned int uid,gid;
+	int r,symsize,dessize;
+	unsigned long mode;
+	char *ptrsym;
+	ptrsym=malloc(sb->st_size + 1);
+	r=readlink(path, ptrsym, sb->st_size+1);
+	if (r < 0) {
+	        perror("lstat");
+	        exit(EXIT_FAILURE);
+	    }
+
+	ptrsym[sb->st_size]='\0';
+	mode=(unsigned long) sb->st_mode;
+	uid=(unsigned int)sb->st_uid;
+	gid=(unsigned int)sb->st_gid;
+	symsize=strlen(path);
+	dessize=strlen(ptrsym);
+	if (fprintf(des,"s\n%d\n%d\n%s\n%s\n%lu\n%d\n%d\n",symsize,dessize,path,ptrsym,mode,uid,gid)<0)
+	{
+	      fprintf(stderr, "symlink - 'Write on file' error\n");
+	      exit(EXIT_FAILURE);
+	}
+	//6 info things
+	free(ptrsym);
+	return des;
+
+}
